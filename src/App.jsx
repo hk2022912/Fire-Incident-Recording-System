@@ -1,0 +1,867 @@
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+
+// ── Django API ─────────────────────────────────────────────────────────────
+const API = 'http://localhost:8000/api';
+const api = {
+  get:    path          => fetch(`${API}${path}`),
+  post:   (path, body)  => fetch(`${API}${path}`, { method:'POST',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }),
+  put:    (path, body)  => fetch(`${API}${path}`, { method:'PUT',    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }),
+  patch:  (path, body)  => fetch(`${API}${path}`, { method:'PATCH',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }),
+  delete: path          => fetch(`${API}${path}`, { method:'DELETE' }),
+};
+
+// ── Constants ──────────────────────────────────────────────────────────────
+const MNAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const MSHORT = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+const ALARMS = ['1st Alarm','2nd Alarm','3rd Alarm','4th Alarm','5th Alarm'];
+
+// Fallback while Django loads
+const INIT_PERSONNEL = [
+  { id:1, slot:1, name:'FO1 Gelmer Phrenchet E Dela Rosa', colorClass:'u1' },
+  { id:2, slot:2, name:'FO1 Marjun L Tuico',               colorClass:'u2' },
+];
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+const monthIdx = s => { const l=s.toLowerCase(); const i=MNAMES.findIndex(m=>m.toLowerCase()===l); return i!==-1?i:MSHORT.indexOf(l); };
+const parseTimeMin = t => { const m=(t||'').match(/(\d{2,4})H?/i); if(!m)return 0; const s=m[1].padStart(4,'0'); return +s.slice(0,2)*60+ +s.slice(2,4); };
+const fmtDate = ds => { if(!ds)return''; const d=new Date(ds+'T12:00:00'); return String(d.getDate()).padStart(2,'0')+' '+MNAMES[d.getMonth()]+' '+d.getFullYear(); };
+const fmtDmg  = v => (+v)?'₱'+Number(v).toLocaleString():'—';
+const getInitials = name => name.trim().split(/\s+/).map(w=>w[0]).join('').toUpperCase().slice(0,2);
+const getSorted   = incidents => [...incidents].sort((a,b)=>{ const da=new Date(a.date+'T12:00:00').getTime(),db=new Date(b.date+'T12:00:00').getTime(); return da!==db?da-db:parseTimeMin(a.time)-parseTimeMin(b.time); });
+
+// normalise Django response → same shape React expects
+const normaliseIncident = inc => ({ ...inc, damage: Number(inc.damage)||0 });
+
+// ── Search parser ──────────────────────────────────────────────────────────
+const parseHumanDate = str => { const m=str.trim().match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/i); if(!m)return null; const mon=monthIdx(m[2]); if(mon===-1)return null; return`${m[3]}-${String(mon+1).padStart(2,'0')}-${String(+m[1]).padStart(2,'0')}`; };
+const parseQuery = q => {
+  q=(q||'').trim(); if(!q)return{type:'none'};
+  const rm=q.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/i);
+  if(rm){const d1=parseHumanDate(`${rm[1]} ${rm[2]} ${rm[3]}`),d2=parseHumanDate(`${rm[4]} ${rm[5]} ${rm[6]}`);if(d1&&d2)return{type:'range',from:d1,to:d2,label:`${fmtDate(d1)} – ${fmtDate(d2)}`};}
+  const dm=q.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/i); if(dm){const d=parseHumanDate(q);if(d)return{type:'date',date:d,label:`Date: ${fmtDate(d)}`};}
+  const mym=q.match(/^([A-Za-z]+)\s+(\d{4})$/i); if(mym){const mn=monthIdx(mym[1]);if(mn!==-1)return{type:'my',month:mn,year:+mym[2],label:`${MNAMES[mn]} ${mym[2]}`};}
+  if(/^\d{4}$/.test(q))return{type:'year',year:+q,label:`Year: ${q}`};
+  return{type:'text',text:q.toLowerCase(),label:`"${q}"`};
+};
+const matchQuery = (parsed,inc) => {
+  const d=new Date(inc.date+'T12:00:00');
+  if(parsed.type==='none')return true;
+  if(parsed.type==='date')return inc.date===parsed.date;
+  if(parsed.type==='my')return d.getMonth()===parsed.month&&d.getFullYear()===parsed.year;
+  if(parsed.type==='year')return d.getFullYear()===parsed.year;
+  if(parsed.type==='range'){const ts=d.getTime();return ts>=new Date(parsed.from+'T00:00:00').getTime()&&ts<=new Date(parsed.to+'T23:59:59').getTime();}
+  if(parsed.type==='text'){const t=parsed.text;return['location','station','occupancy','engine'].some(k=>(inc[k]||'').toLowerCase().includes(t));}
+  return true;
+};
+
+// ── Bulk upload helpers ────────────────────────────────────────────────────
+const BMON={...Object.fromEntries(MNAMES.map((m,i)=>[m.toLowerCase(),i])),...Object.fromEntries(MSHORT.map((m,i)=>[m,i]))};
+const parseBulkDate=raw=>{if(!raw)return null;const m=raw.trim().match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s+(\d{3,4}H?)$/i);if(!m)return null;const mon=BMON[m[2].toLowerCase()];if(mon===undefined)return null;const time=m[4].toUpperCase().endsWith('H')?m[4].toUpperCase():m[4].toUpperCase()+'H';return{dateStr:`${m[3]}-${String(mon+1).padStart(2,'0')}-${String(+m[1]).padStart(2,'0')}`,time};};
+const parseCSVText=text=>{const lines=text.split(/\r?\n/).filter(l=>l.trim());if(!lines.length)return[];const delim=lines[0].includes('\t')?'\t':',';const parseLine=line=>{if(delim==='\t')return line.split('\t').map(c=>c.trim());const res=[];let cur='',inQ=false;for(let i=0;i<line.length;i++){if(line[i]==='"'){inQ=!inQ}else if(line[i]===','&&!inQ){res.push(cur.trim());cur='';}else cur+=line[i];}res.push(cur.trim());return res;};const hdr=parseLine(lines[0]).map(h=>h.toLowerCase().replace(/[\s&\/\\#,+()$~%.'":*?<>{}]/g,''));return lines.slice(1).map((line,i)=>{const cols=parseLine(line),obj={};hdr.forEach((h,idx)=>{obj[h]=cols[idx]||'';});return{obj,rowNum:i+1};});};
+const mapBulkRow=(row,inputterName)=>{const o=row.obj,errs=[];const get=(...keys)=>{for(const k of keys)for(const[h,v]of Object.entries(o))if(h.includes(k))return v;return'';};const rawDate=get('timedate','timeanddate','time','date'),parsed=parseBulkDate(rawDate);if(!parsed)errs.push(`Row ${row.rowNum}: Invalid date "${rawDate}" — use DD Month YYYY HHMMH`);const loc=get('location','barangay','area');if(!loc)errs.push(`Row ${row.rowNum}: Location is required`);const inv=get('involved','type');if(!['structural','non-structural'].includes((inv||'').toLowerCase()))errs.push(`Row ${row.rowNum}: Involved must be Structural or Non-Structural`);return{rowNum:row.rowNum,valid:errs.length===0,errors:errs,data:{time:parsed?parsed.time:'',date:parsed?parsed.dateStr:'',location:loc,involved:inv?(inv.toLowerCase()==='structural'?'Structural':'Non-Structural'):'',occupancy:get('occupancy'),damage:+(get('damage','estimateddamage'))||0,injured:+(get('injured'))||0,casualty:+(get('casualty','casualties'))||0,station:get('station','stationno'),engine:get('engine','engineno'),alarm:get('alarm','alarmstatus')||'1st Alarm',inputter:inputterName}};};
+const smartPages=(cur,total)=>{if(total<=7)return Array.from({length:total},(_,i)=>i+1);const show=new Set([1,total,cur,cur-1,cur+1].filter(p=>p>=1&&p<=total));const s=[...show].sort((a,b)=>a-b),res=[];for(let i=0;i<s.length;i++){if(i>0&&s[i]-s[i-1]>1)res.push('...');res.push(s[i]);}return res;};
+
+// ── Tiny shared components ────────────────────────────────────────────────
+const AlarmTag=({alarm})=>{if(!alarm)return null;const cl=alarm.toLowerCase().startsWith('1st')?'tag-a1':alarm.toLowerCase().startsWith('2nd')?'tag-a2':'tag-a3';return<span className={`tag ${cl}`}>{alarm}</span>;};
+const InvTag  =({value})=><span className={`tag ${value==='Structural'?'tag-s':'tag-n'}`}>{value}</span>;
+const DmgCell =({value})=><td className={`td-dmg${value?' v':''}`}>{fmtDmg(value)}</td>;
+const NumCell =({value,cls})=>{const v=+value||0;return<td className={`td-num${v===0?' z':` ${cls}`}`}>{v}</td>;};
+const InpCell =({name,personnel})=>{const p=personnel.find(u=>u.name===name);const cl=p?p.colorClass:'u1';return<span className="inp-cell" title={name}><span className={`inp-dot ${cl==='u1'?'inp-d':'inp-t'}`}/><span className="inp-cell-name">{name}</span></span>;};
+
+let _toastId=0;
+
+// ══════════════════════════════════════════════════════════════════════════
+// APP
+// ══════════════════════════════════════════════════════════════════════════
+export default function App() {
+  // ── Core state ──
+  const [personnel,   setPersonnel]   = useState(INIT_PERSONNEL);
+  const [curUserIdx,  setCurUserIdx]  = useState(0);
+  const [incidents,   setIncidents]   = useState([]);
+  const [loading,     setLoading]     = useState(true);   // initial data load
+  const [apiError,    setApiError]    = useState('');     // connection error banner
+
+  // ── Navigation ──
+  const [page,        setPage]        = useState('dashboard');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // ── Incident modal ──
+  const [modalOpen,   setModalOpen]   = useState(false);
+  const [editingId,   setEditingId]   = useState(null);
+  const [saving,      setSaving]      = useState(false);
+
+  // ── Delete confirm ──
+  const [deleteId,    setDeleteId]    = useState(null);
+
+  // ── Toasts ──
+  const [toasts,      setToasts]      = useState([]);
+
+  // ── Incidents table state ──
+  const [search,      setSearch]      = useState('');
+  const [filterInv,   setFilterInv]   = useState('');
+  const [filterInp,   setFilterInp]   = useState('');
+  const [incPage,     setIncPage]     = useState(1);
+  const [perPage,     setPerPage]     = useState(10);
+  const [jumpVal,     setJumpVal]     = useState('');
+
+  // ── Bulk upload state ──
+  const [bulkRows,    setBulkRows]    = useState([]);
+  const [bulkPreview, setBulkPreview] = useState(false);
+  const [bulkResult,  setBulkResult]  = useState(null);
+  const [bulkSaving,  setBulkSaving]  = useState(false);
+  const fileRef = useRef();
+
+  // ── Export modal ──
+  const [expOpen,  setExpOpen]  = useState(false);
+  const [expType,  setExpType]  = useState('all');
+  const [expYear,  setExpYear]  = useState(new Date().getFullYear());
+  const [expMonth, setExpMonth] = useState(new Date().getMonth());
+  const [expMyear, setExpMyear] = useState(new Date().getFullYear());
+  const [expFrom,  setExpFrom]  = useState('');
+  const [expTo,    setExpTo]    = useState('');
+
+  // ── Personnel edit modal ──
+  const [nameModalIdx, setNameModalIdx] = useState(null);
+  const [newNameVal,   setNewNameVal]   = useState('');
+  const [newNameErr,   setNewNameErr]   = useState('');
+  const [nameSaving,   setNameSaving]   = useState(false);
+
+  // ── Derived ──
+  const curUser = personnel[curUserIdx].name;
+  const sorted  = useMemo(()=>getSorted(incidents),[incidents]);
+
+  // ── Toast ──
+  const toast = useCallback((msg,type='')=>{
+    const id=++_toastId;
+    setToasts(t=>[...t,{id,msg,type}]);
+    setTimeout(()=>setToasts(t=>t.filter(x=>x.id!==id)),3800);
+  },[]);
+
+  // ══ BOOT — load personnel + incidents from Django ═══════════════════════
+  useEffect(()=>{
+    const load = async () => {
+      setLoading(true);
+      setApiError('');
+      try {
+        const [pRes, iRes] = await Promise.all([
+          api.get('/personnel/'),
+          api.get('/incidents/'),
+        ]);
+        if (!pRes.ok || !iRes.ok) throw new Error('Server returned an error.');
+        const [pData, iData] = await Promise.all([pRes.json(), iRes.json()]);
+
+        // map Django snake_case color_class → camelCase colorClass
+        setPersonnel(pData.map(p=>({...p, colorClass: p.color_class})));
+        setIncidents(iData.map(normaliseIncident));
+      } catch(e) {
+        setApiError('Cannot reach Django server at localhost:8000. Is it running?');
+      } finally {
+        setLoading(false);
+      }
+    };
+    load();
+  },[]);
+
+  // ── Sidebar mobile overlay ──
+  useEffect(()=>{
+    const el=document.getElementById('sb-overlay');
+    if(!el)return;
+    if(sidebarOpen){el.classList.add('show');document.body.style.overflow='hidden';}
+    else{el.classList.remove('show');document.body.style.overflow='';}
+  },[sidebarOpen]);
+
+  const navTo = p => { setPage(p); setSidebarOpen(false); setIncPage(1); };
+
+  // ══ INCIDENT MODAL ══════════════════════════════════════════════════════
+  const emptyForm = useCallback(()=>({time:'',date:'',location:'',involved:'Structural',occupancy:'',damage:'',injured:'0',casualty:'0',station:'',engine:'',alarm:'1st Alarm',inputter:curUser}),[curUser]);
+  const [form, setForm]       = useState(emptyForm);
+  const [formErrs, setFormErrs] = useState({});
+  const setF = (k,v) => setForm(f=>({...f,[k]:v}));
+
+  const openAdd = () => { setEditingId(null); setForm(emptyForm()); setFormErrs({}); setModalOpen(true); };
+  const openEdit = id => {
+    const inc=incidents.find(i=>i.id===id); if(!inc)return;
+    setEditingId(id);
+    setForm({...inc,damage:inc.damage||'',injured:String(inc.injured??0),casualty:String(inc.casualty??0)});
+    setFormErrs({}); setModalOpen(true);
+  };
+
+  const saveIncident = async () => {
+    const errs={};
+    if(!form.time.trim()) errs.time='Required';
+    if(!form.date)        errs.date='Required';
+    if(!form.location.trim()) errs.location='Required';
+    setFormErrs(errs); if(Object.keys(errs).length)return;
+
+    const body={...form,damage:+form.damage||0,injured:+form.injured||0,casualty:+form.casualty||0};
+    setSaving(true);
+    try {
+      if(editingId!==null){
+        const res = await api.put(`/incidents/${editingId}/`, body);
+        if(!res.ok) throw new Error();
+        const updated = normaliseIncident(await res.json());
+        setIncidents(p=>p.map(i=>i.id===editingId?updated:i));
+        toast('Incident updated successfully.','s');
+      } else {
+        const res = await api.post('/incidents/', body);
+        if(!res.ok) throw new Error();
+        const created = normaliseIncident(await res.json());
+        setIncidents(p=>[...p,created]);
+        toast('Incident added.','s');
+      }
+      setModalOpen(false);
+    } catch {
+      toast('Failed to save — check Django is running.','e');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // ══ DELETE ══════════════════════════════════════════════════════════════
+  const confirmDelete = async () => {
+    try {
+      const res = await api.delete(`/incidents/${deleteId}/`);
+      if(!res.ok) throw new Error();
+      setIncidents(p=>p.filter(i=>i.id!==deleteId));
+      toast('Record deleted.','s');
+    } catch {
+      toast('Failed to delete — check Django is running.','e');
+    } finally {
+      setDeleteId(null);
+    }
+  };
+
+  // ══ INCIDENTS TABLE ══════════════════════════════════════════════════════
+  const filtered = useMemo(()=>{
+    const parsed=parseQuery(search);
+    return sorted.filter(inc=>matchQuery(parsed,inc)&&(!filterInv||inc.involved===filterInv)&&(!filterInp||inc.inputter===filterInp));
+  },[sorted,search,filterInv,filterInp]);
+  const totalPages=Math.ceil(filtered.length/perPage)||1;
+  const safePage=Math.min(incPage,totalPages);
+  const pageData=filtered.slice((safePage-1)*perPage,safePage*perPage);
+  const tDmg=filtered.reduce((s,i)=>s+(+i.damage||0),0),tInj=filtered.reduce((s,i)=>s+(+i.injured||0),0),tCas=filtered.reduce((s,i)=>s+(+i.casualty||0),0);
+  const bannerParts=[]; const pq=parseQuery(search); if(pq.type!=='none')bannerParts.push(pq.label); if(filterInv)bannerParts.push(`Type: ${filterInv}`); if(filterInp)bannerParts.push(`By: ${filterInp}`);
+  const goPage=p=>{if(p<1||p>totalPages)return;setIncPage(p);setJumpVal('');};
+  const clearSearch=()=>{setSearch('');setFilterInv('');setFilterInp('');setIncPage(1);};
+
+  // ══ BULK UPLOAD ══════════════════════════════════════════════════════════
+  const handleFile = file => {
+    if(!file)return;
+    const ext=file.name.split('.').pop().toLowerCase();
+    if(!['csv','tsv','txt','xlsx','xls'].includes(ext)){toast('Please upload a CSV, TSV, or Excel file.','e');return;}
+    if(ext==='xlsx'||ext==='xls'){
+      if(!window.XLSX){toast('Excel support not loaded.','e');return;}
+      const reader=new FileReader();
+      reader.onload=e=>{
+        try{
+          const wb=window.XLSX.read(e.target.result,{type:'binary'}),ws=wb.Sheets[wb.SheetNames[0]];
+          const jsonRows=window.XLSX.utils.sheet_to_json(ws,{header:1,defval:''});if(jsonRows.length<2){toast('No data rows found.','e');return;}
+          const hdr=jsonRows[0].map(h=>String(h).toLowerCase().replace(/[\s&\/\\#,+()$~%.'":*?<>{}]/g,''));
+          const rows=jsonRows.slice(1).map((cols,i)=>{const obj={};hdr.forEach((h,idx)=>{obj[h]=String(cols[idx]||'');});return{obj,rowNum:i+1};});
+          setBulkRows(rows.map(r=>mapBulkRow(r,curUser)));setBulkPreview(true);setBulkResult(null);
+        }catch(err){toast('Error reading Excel: '+err.message,'e');}
+      };
+      reader.readAsBinaryString(file);
+    } else {
+      const reader=new FileReader();
+      reader.onload=e=>{const rows=parseCSVText(e.target.result);if(!rows.length){toast('No data rows found.','e');return;}setBulkRows(rows.map(r=>mapBulkRow(r,curUser)));setBulkPreview(true);setBulkResult(null);};
+      reader.readAsText(file);
+    }
+  };
+
+  const confirmBulk = async () => {
+    const valid=bulkRows.filter(r=>r.valid);
+    if(!valid.length){toast('No valid rows to import.','e');return;}
+    const skipped=bulkRows.filter(r=>!r.valid).length;
+
+    setBulkSaving(true);
+    try {
+      // Send all valid rows to Django in one request
+      const res = await api.post('/incidents/bulk/', valid.map(r=>r.data));
+      if(!res.ok) throw new Error();
+      const { created, errors:apiErrors } = await res.json();
+
+      // Add the Django-created records (with real IDs) to local state
+      setIncidents(p=>[...p,...created.map(normaliseIncident)]);
+
+      const importedCount = created.length;
+      const failedCount   = skipped + apiErrors.length;
+      setBulkResult({count:importedCount, skipped:failedCount});
+      setBulkPreview(false);
+      setBulkRows([]);
+      if(fileRef.current) fileRef.current.value='';
+      toast(`${importedCount} records imported.${failedCount?' '+failedCount+' skipped.':''}`, 's');
+    } catch {
+      toast('Bulk import failed — check Django is running.','e');
+    } finally {
+      setBulkSaving(false);
+    }
+  };
+
+  const clearUpload=()=>{setBulkRows([]);setBulkPreview(false);setBulkResult(null);if(fileRef.current)fileRef.current.value='';};
+  const dlTemplate=()=>{
+    const headers=['Time & Date','Location','Involved','Occupancy','Damage','Injured','Casualty','Station','Engine','Alarm'];
+    const sample=[['02 January 2017 0900H','SAMPLE 6','Non-Structural','GRASSFIRE','0','0','0','STATION 6','ENGINE 4','1st Alarm'],['04 March 2026 0133H','Brgy Puerto','Structural','Mercantile','6000','2','1','Station 8','Engine 8','3rd Alarm']];
+    const csv=[headers,...sample].map(r=>r.map(c=>`"${c}"`).join(',')).join('\n');
+    const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    Object.assign(document.createElement('a'),{href:url,download:'fire-incident-template.csv'}).click();
+    URL.revokeObjectURL(url);toast('Template downloaded.','s');
+  };
+
+  // ══ EXPORT ══════════════════════════════════════════════════════════════
+  const doExport=()=>{
+    let exp=[...sorted];
+    if(expType==='year')exp=exp.filter(i=>new Date(i.date).getFullYear()===expYear);
+    else if(expType==='month')exp=exp.filter(i=>{const d=new Date(i.date);return d.getMonth()===expMonth&&d.getFullYear()===expMyear;});
+    else if(expType==='range'){if(!expFrom||!expTo){toast('Select both dates.','e');return;}exp=exp.filter(i=>{const ts=new Date(i.date+'T12:00:00').getTime();return ts>=new Date(expFrom+'T00:00:00').getTime()&&ts<=new Date(expTo+'T23:59:59').getTime();});}
+    if(!exp.length){toast('No records for selected period.','e');return;}
+    const headers=['No.','Time & Date','Location','Involved','Occupancy','Estimated Damage','Injured','Casualty','Station No.','Engine No.','Alarm Status','Inputted By'];
+    const rows=exp.map(inc=>[String(sorted.findIndex(i=>i.id===inc.id)+1).padStart(2,'0'),`${fmtDate(inc.date)} ${inc.time}`,inc.location,inc.involved,inc.occupancy,inc.damage||0,inc.injured||0,inc.casualty||0,inc.station,inc.engine,inc.alarm,inc.inputter]);
+    const eDmg=exp.reduce((s,i)=>s+(+i.damage||0),0),eInj=exp.reduce((s,i)=>s+(+i.injured||0),0),eCas=exp.reduce((s,i)=>s+(+i.casualty||0),0);
+    rows.push([],[,`Total Incidents`,`Total Damage`,`Total Injured`,`Total Casualties`,,,,,,,,`Prepared By`],[,String(exp.length).padStart(2,'0'),`PHP ${eDmg.toLocaleString()}`,eInj,eCas,,,,,,,,curUser]);
+    const csv=[headers,...rows].map(r=>r.map(c=>`"${String(c??'').replace(/"/g,'""')}"`).join(',')).join('\n');
+    const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    Object.assign(document.createElement('a'),{href:url,download:`fire-incidents-${new Date().toISOString().slice(0,10)}.csv`}).click();
+    URL.revokeObjectURL(url);setExpOpen(false);toast(`Exported ${exp.length} records.`,'s');
+  };
+
+  // ══ PERSONNEL ══════════════════════════════════════════════════════════
+  const openNameModal=idx=>{setNameModalIdx(idx);setNewNameVal(personnel[idx].name);setNewNameErr('');};
+  const validateNewName=v=>{if(!v.trim())return'Name cannot be empty.';if(v.trim()===personnel[1-nameModalIdx]?.name)return'Already used by the other personnel.';return'';};
+  const savePersonnelName=async()=>{
+    const err=validateNewName(newNameVal);if(err){setNewNameErr(err);return;}
+    const slot=personnel[nameModalIdx].slot;
+    setNameSaving(true);
+    try {
+      const res=await api.patch(`/personnel/${slot}/`,{name:newNameVal.trim()});
+      if(!res.ok) throw new Error();
+      const updated=await res.json();
+      setPersonnel(p=>p.map((x,i)=>i===nameModalIdx?{...x,name:updated.name}:x));
+      setNameModalIdx(null);
+      toast(`Name updated to "${updated.name}".`,'s');
+    } catch {
+      toast('Failed to update name — check Django is running.','e');
+    } finally {
+      setNameSaving(false);
+    }
+  };
+
+  // ══ YEAR SUMMARY ════════════════════════════════════════════════════════
+  const yearData=useMemo(()=>{
+    const map={};
+    incidents.forEach(inc=>{
+      const yr=new Date(inc.date+'T12:00:00').getFullYear();
+      if(!map[yr])map[yr]={year:yr,total:0,structural:0,nonstructural:0,damage:0,injured:0,casualty:0,u1:0,u2:0};
+      const y=map[yr];y.total++;
+      if(inc.involved==='Structural')y.structural++;else y.nonstructural++;
+      y.damage+=(+inc.damage||0);y.injured+=(+inc.injured||0);y.casualty+=(+inc.casualty||0);
+      if(inc.inputter===personnel[0].name)y.u1++;else y.u2++;
+    });
+    return Object.values(map).sort((a,b)=>a.year-b.year);
+  },[incidents,personnel]);
+  const yrTotals=yearData.reduce((acc,y)=>{Object.keys(acc).forEach(k=>acc[k]+=y[k]);return acc;},{total:0,structural:0,nonstructural:0,damage:0,injured:0,casualty:0,u1:0,u2:0});
+
+  // ══ STATS ═══════════════════════════════════════════════════════════════
+  const total=incidents.length,structural=incidents.filter(i=>i.involved==='Structural').length;
+  const allDmg=incidents.reduce((s,i)=>s+(+i.damage||0),0),allInj=incidents.reduce((s,i)=>s+(+i.injured||0),0),allCas=incidents.reduce((s,i)=>s+(+i.casualty||0),0);
+  const u1cnt=incidents.filter(i=>i.inputter===personnel[0].name).length,u2cnt=incidents.filter(i=>i.inputter===personnel[1].name).length;
+
+  // ══════════════════════════════════════════════════════════════════════
+  // RENDER
+  // ══════════════════════════════════════════════════════════════════════
+
+  // ── Loading screen ──
+  if(loading) return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--gray)',flexDirection:'column',gap:16}}>
+      <div style={{width:48,height:48,border:'4px solid var(--navy-dim2)',borderTop:'4px solid var(--navy)',borderRadius:'50%',animation:'spin 0.8s linear infinite'}}/>
+      <div style={{fontFamily:'Roboto Condensed,sans-serif',fontSize:14,color:'var(--navy)',letterSpacing:'.08em',textTransform:'uppercase'}}>Loading from Django…</div>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+
+  return (
+    <div className="shell">
+      {/* Django connection error banner */}
+      {apiError&&(
+        <div style={{position:'fixed',top:0,left:0,right:0,zIndex:9999,background:'var(--danger)',color:'#fff',padding:'10px 20px',fontSize:13,fontWeight:700,display:'flex',alignItems:'center',gap:12}}>
+          ⚠ {apiError}
+          <button onClick={()=>window.location.reload()} style={{marginLeft:'auto',background:'rgba(255,255,255,.2)',border:'none',color:'#fff',padding:'4px 12px',borderRadius:4,cursor:'pointer',fontSize:12,fontWeight:700}}>Retry</button>
+        </div>
+      )}
+
+      {/* Sidebar overlay */}
+      <div className="sb-overlay" id="sb-overlay" onClick={()=>setSidebarOpen(false)}/>
+
+      {/* ── SIDEBAR ── */}
+      <nav className={`sidebar${sidebarOpen?' open':''}`}>
+        <div className="sb-brand">
+          <div className="sb-brand-inner">
+            <div className="sb-emblem">
+              <img src="/BFP logo.png" alt="BFP" style={{width:'100%',height:'100%',objectFit:'contain',borderRadius:'var(--r)'}} onError={e=>{e.target.style.display='none';e.target.nextSibling.style.display='flex';}}/>
+              <svg viewBox="0 0 24 24" style={{display:'none',width:26,height:26,stroke:'#fff',fill:'none',strokeWidth:1.8,strokeLinecap:'round'}}><path d="/BFP logo.png"/></svg>
+            </div>
+            <div className="sb-title">Fire Incident<br/>Recording System</div>
+          </div>
+          <div className="sb-dept">Operations Branch Office</div>
+        </div>
+        <div className="nav">
+          <div className="nav-section">Main Menu</div>
+          {[
+            {key:'dashboard',label:'Dashboard',icon:<><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>},
+            {key:'incidents',label:'Incident Records',badge:true,icon:<><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></>},
+            {key:'bulk',label:'Bulk Upload',icon:<><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0018 9h-1.26A8 8 0 103 16.3"/></>},
+            {key:'reports',label:'Reports & Export',icon:<><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></>},
+          ].map(item=>(
+            <button key={item.key} className={`nav-item${page===item.key?' active':''}`} onClick={()=>navTo(item.key)}>
+              <span className="nav-icon"><svg viewBox="0 0 24 24">{item.icon}</svg></span>
+              <span>{item.label}</span>
+              {item.badge&&<span className="nav-badge">{total}</span>}
+            </button>
+          ))}
+          <div className="nav-section">Settings</div>
+          <button className={`nav-item${page==='personnel'?' active':''}`} onClick={()=>navTo('personnel')}>
+            <span className="nav-icon"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg></span>
+            <span>Manage Personnel</span>
+          </button>
+        </div>
+        <div className="sb-foot">
+          <div className="user-card">
+            <div className="user-lbl">Active Personnel</div>
+            <div className="user-name-row">
+              <span className={`user-dot${curUserIdx===0?'':' blue'}`}/>
+              <span>{curUser}</span>
+            </div>
+            <div className="user-foot-actions">
+              <button className="switch-btn" onClick={()=>{const n=1-curUserIdx;setCurUserIdx(n);toast(`Switched to ${personnel[n].name}.`);}}>Switch User</button>
+              <span style={{color:'rgba(211,211,211,.2)',fontSize:11}}>•</span>
+              <button className="edit-name-btn" onClick={()=>openNameModal(curUserIdx)}>Edit Name</button>
+            </div>
+          </div>
+        </div>
+      </nav>
+
+      {/* ── MAIN ── */}
+      <div className="main" style={apiError?{paddingTop:40}:{}}>
+        {/* Topbar */}
+        <div className="topbar">
+          <button className="hamburger" onClick={()=>setSidebarOpen(s=>!s)} aria-label="Toggle menu">
+            <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+          </button>
+          <div className="tb-left">
+            <div className="tb-title">{{dashboard:'Dashboard',incidents:'Incident Records',bulk:'Bulk Upload',reports:'Reports & Export',personnel:'Manage Personnel'}[page]}</div>
+            <div className="tb-sub">{{dashboard:'Overview of all fire incident records',incidents:'Search, filter, and manage all fire incidents',bulk:'Import multiple incidents from a CSV, TSV, or Excel file',reports:'Generate and download reports with custom date range',personnel:'Edit personnel names and manage active user'}[page]}</div>
+          </div>
+          <div className="tb-right">
+            <button className="btn btn-navy-outline btn-sm" onClick={()=>navTo('bulk')}>Bulk Upload</button>
+            <button className="btn btn-navy-outline btn-sm" onClick={()=>{navTo('reports');setExpOpen(true);}}>Export</button>
+            <button className="btn btn-primary btn-sm" onClick={openAdd}>+ Add Incident</button>
+          </div>
+        </div>
+
+        {/* ── CONTENT ── */}
+        <div className="content">
+
+          {/* ════ DASHBOARD ════ */}
+          {page==='dashboard'&&(
+            <>
+              <div className="stats-grid">
+                {[
+                  {label:'Total Incidents',val:total,sub:'all records'},
+                  {label:'Structural',val:structural,sub:'fires',acc:true},
+                  {label:'Non-Structural',val:total-structural,sub:'fires'},
+                  {label:'Est. Damage',val:'₱'+allDmg.toLocaleString(),sub:'total',acc:true,m:true},
+                  {label:'Total Injured',val:allInj,sub:'persons',acc:true},
+                  {label:'Total Casualties',val:allCas,sub:'persons',dng:true,r:true},
+                ].map((s,i)=>(
+                  <div key={i} className={`stat-card${s.acc?' acc':''}${s.dng?' dng':''}`}>
+                    <div className="stat-lbl">{s.label}</div>
+                    <div className={`stat-val${s.m?' m':''}${s.r?' r':''}`}>{s.val}</div>
+                    <div className="stat-sub">{s.sub}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="sec-div"><div className="div-acc"/><div className="sec-title">Recent Incidents</div><div className="div-line"/><button className="btn btn-outline btn-sm" onClick={()=>navTo('incidents')}>View All</button></div>
+              <div className="tcard">
+                <div className="tc-head"><span className="tc-title">Latest Fire Incidents</span><div className="tc-actions"><button className="btn btn-primary btn-sm" onClick={openAdd}>+ Add</button></div></div>
+                <div className="tscroll">
+                  <table>
+                    <thead><tr><th>No.</th><th>Time &amp; Date</th><th>Location</th><th>Involved</th><th>Alarm</th><th>Damage</th><th>Inj.</th><th>Cas.</th><th>Station</th><th>Inputted By</th></tr></thead>
+                    <tbody>
+                      {sorted.slice(-5).reverse().map(inc=>{
+                        const no=sorted.findIndex(i=>i.id===inc.id)+1;
+                        return<tr key={inc.id}>
+                          <td className="td-no">{String(no).padStart(2,'0')}</td>
+                          <td className="td-dt"><span className="td-time">{inc.time}</span> {fmtDate(inc.date)}</td>
+                          <td className="td-loc">{inc.location}</td>
+                          <td><InvTag value={inc.involved}/></td>
+                          <td><AlarmTag alarm={inc.alarm}/></td>
+                          <DmgCell value={inc.damage}/>
+                          <NumCell value={inc.injured} cls="inj"/>
+                          <NumCell value={inc.casualty} cls="cas"/>
+                          <td className="td-stn">{inc.station}</td>
+                          <td style={{maxWidth:120,overflow:'hidden'}}><InpCell name={inc.inputter} personnel={personnel}/></td>
+                        </tr>;
+                      })}
+                    </tbody>
+                  </table>
+                  {!total&&<div className="empty-state"><div className="empty-icon-wrap"><svg viewBox="0 0 24 24"><path d="M12 2C9 6.5 6 8.5 6 13.5a6 6 0 0012 0C18 8.5 15 6.5 12 2z"/></svg></div><div className="empty-title">No incidents recorded yet</div><div className="empty-sub">Click "+ Add Incident" to begin entering records</div></div>}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ════ INCIDENTS ════ */}
+          {page==='incidents'&&(
+            <div className="tcard">
+              <div className="tc-head"><span className="tc-title">Incident Records</span><div className="tc-actions"><button className="btn btn-primary btn-sm" onClick={openAdd}>+ Add Incident</button></div></div>
+              <div className="search-wrap">
+                <div className="search-row">
+                  <div className="search-field-wrap">
+                    <span className="search-ico"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
+                    <input type="text" className="search-input" value={search} onChange={e=>{setSearch(e.target.value);setIncPage(1);}} placeholder="Search by date, month, year, range, location, station..."/>
+                  </div>
+                  <div className="search-sep"/>
+                  <select className="f-select" value={filterInv} onChange={e=>{setFilterInv(e.target.value);setIncPage(1);}}>
+                    <option value="">All Types</option><option>Structural</option><option>Non-Structural</option>
+                  </select>
+                  <select className="f-select" value={filterInp} onChange={e=>{setFilterInp(e.target.value);setIncPage(1);}}>
+                    <option value="">All Personnel</option>
+                    {personnel.map(p=><option key={p.id} value={p.name}>{p.name}</option>)}
+                  </select>
+                  <button className="clear-btn" onClick={clearSearch}>Clear</button>
+                </div>
+                <div>
+                  <div className="search-hint">Try: <strong>04 March 2026</strong> · <strong>March 2026</strong> · <strong>2018</strong> · <strong>01 Jan 2018 – 31 Dec 2018</strong> · <strong>Brgy Puerto</strong> · <strong>Station 4</strong></div>
+                  <div className="pills">
+                    {['March 2026','2017','2026'].map(v=><span key={v} className="pill" onClick={()=>{setSearch(v);setIncPage(1);}}>{v}</span>)}
+                    <span className="pill" onClick={()=>{setFilterInv('Structural');setIncPage(1);}}>Structural only</span>
+                  </div>
+                </div>
+              </div>
+              {bannerParts.length>0&&<div className="banner"><span>Filter: {bannerParts.join(' · ')}</span><button className="banner-clear" onClick={clearSearch}>Clear filter</button></div>}
+              <div className="tscroll">
+                <table>
+                  <thead><tr><th style={{width:32}}>No.</th><th style={{width:130}}>Time &amp; Date</th><th>Location</th><th style={{width:90}}>Involved</th><th style={{width:80}}>Occupancy</th><th style={{width:80}}>Damage</th><th style={{width:36}}>Inj.</th><th style={{width:36}}>Cas.</th><th style={{width:72}}>Station</th><th style={{width:68}}>Engine</th><th style={{width:72}}>Alarm</th><th style={{width:120}}>Inputted By</th><th style={{width:90}}>Actions</th></tr></thead>
+                  <tbody>
+                    {pageData.map(inc=>{
+                      const no=sorted.findIndex(i=>i.id===inc.id)+1;
+                      return<tr key={inc.id}>
+                        <td className="td-no">{String(no).padStart(2,'0')}</td>
+                        <td className="td-dt"><span className="td-time">{inc.time}</span> {fmtDate(inc.date)}</td>
+                        <td className="td-loc">{inc.location}</td>
+                        <td><InvTag value={inc.involved}/></td>
+                        <td style={{fontSize:11,maxWidth:80,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{inc.occupancy||'—'}</td>
+                        <DmgCell value={inc.damage}/>
+                        <NumCell value={inc.injured} cls="inj"/>
+                        <NumCell value={inc.casualty} cls="cas"/>
+                        <td className="td-stn">{inc.station}</td>
+                        <td className="td-stn">{inc.engine}</td>
+                        <td><AlarmTag alarm={inc.alarm}/></td>
+                        <td style={{maxWidth:120,overflow:'hidden'}}><InpCell name={inc.inputter} personnel={personnel}/></td>
+                        <td><div className="act-cell"><button className="act-btn" onClick={()=>openEdit(inc.id)}>Edit</button><button className="act-btn del" onClick={()=>setDeleteId(inc.id)}>Del</button></div></td>
+                      </tr>;
+                    })}
+                  </tbody>
+                  {filtered.length>0&&<tfoot><tr className="trow"><td className="tl" colSpan={2}>Totals</td><td className="tv" colSpan={3}>{filtered.length} incident{filtered.length!==1?'s':''}</td><td className="tv">₱{tDmg.toLocaleString()}</td><td className="tinj">{tInj}</td><td className="tcas">{tCas}</td><td colSpan={5}/></tr></tfoot>}
+                </table>
+                {!filtered.length&&<div className="empty-state"><div className="empty-icon-wrap"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div><div className="empty-title">{incidents.length?'No records found':'No incidents recorded yet'}</div><div className="empty-sub">{incidents.length?'Try a different search or clear the filter':'Click "+ Add Incident" to begin entering records'}</div></div>}
+              </div>
+              <div className="pagination">
+                <div className="pg-left">
+                  <span className="pg-info">{filtered.length?`Showing ${(safePage-1)*perPage+1}–${Math.min(safePage*perPage,filtered.length)} of ${filtered.length} record${filtered.length!==1?'s':''}` : 'No records found'}</span>
+                  <div className="pg-rpp"><span className="pg-rpp-lbl">Rows per page:</span>
+                    <select className="pg-rpp-sel" value={perPage} onChange={e=>{setPerPage(+e.target.value);setIncPage(1);}}>
+                      {[10,25,50,100].map(n=><option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div className="pg-right">
+                  <div className="pg-nav">
+                    <button className="pg-btn" onClick={()=>goPage(safePage-1)} disabled={safePage===1}>‹</button>
+                    {smartPages(safePage,totalPages).map((p,i)=>p==='...'?<span key={`e${i}`} className="pg-ellipsis">…</span>:<button key={p} className={`pg-btn${p===safePage?' active':''}`} onClick={()=>goPage(p)}>{p}</button>)}
+                    <button className="pg-btn" onClick={()=>goPage(safePage+1)} disabled={safePage===totalPages}>›</button>
+                  </div>
+                  <div className="pg-jump"><span className="pg-jump-lbl">Go to</span>
+                    <input type="number" className="pg-jump-inp" min="1" max={totalPages} value={jumpVal} onChange={e=>setJumpVal(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){const p=parseInt(jumpVal);if(p>=1&&p<=totalPages)goPage(p);setJumpVal('');}}} placeholder="—"/>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ════ BULK UPLOAD ════ */}
+          {page==='bulk'&&(
+            <>
+              <div className="sec-div"><div className="div-acc"/><div className="sec-title">Step 1 — Upload File</div><div className="div-line"/><button className="btn btn-outline btn-sm" onClick={dlTemplate}>Download Template</button></div>
+              <div className="info-bar">
+                <div className="info-bar-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></div>
+                <span>Accepted: <strong>CSV</strong>, <strong>TSV</strong>, or <strong>Excel (.xlsx)</strong>. Required columns: <em>Time & Date, Location, Involved, Occupancy, Damage, Injured, Casualty, Station, Engine, Alarm</em>. Date format: <code>DD Month YYYY HHMMH</code>.</span>
+              </div>
+              <div className="drop-zone"
+                onDragOver={e=>{e.preventDefault();e.currentTarget.classList.add('over');}}
+                onDragLeave={e=>e.currentTarget.classList.remove('over')}
+                onDrop={e=>{e.preventDefault();e.currentTarget.classList.remove('over');handleFile(e.dataTransfer.files[0]);}}
+                onClick={()=>fileRef.current?.click()}
+              >
+                <div className="dz-icon-wrap"><svg viewBox="0 0 24 24"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0018 9h-1.26A8 8 0 103 16.3"/></svg></div>
+                <div className="dz-title">Drag &amp; Drop your file here</div>
+                <div className="dz-sub">or click to browse — CSV / TSV / Excel accepted</div>
+                <div className="fmt-tags"><span className="fmt-tag">XLSX</span><span className="fmt-tag">CSV</span><span className="fmt-tag">TSV</span></div>
+                <input type="file" ref={fileRef} accept=".csv,.tsv,.txt,.xlsx,.xls" style={{display:'none'}} onChange={e=>handleFile(e.target.files[0])}/>
+              </div>
+              {bulkPreview&&bulkRows.length>0&&(()=>{
+                const v=bulkRows.filter(r=>r.valid).length,inv=bulkRows.length-v,allErrs=bulkRows.flatMap(r=>r.errors);
+                return<>
+                  <div className="sec-div" style={{marginTop:28}}><div className="div-acc"/><div className="sec-title">Step 2 — Review &amp; Confirm</div><div className="div-line"/><span className={`bk-badge ${inv===0?'bk-v':v===0?'bk-e':'bk-m'}`}>{inv===0?`${v} rows ready`:v===0?`All ${inv} rows have errors`:`${v} valid · ${inv} with errors`}</span></div>
+                  {allErrs.length>0&&<div className="val-errs"><div className="val-title">Validation Issues ({allErrs.length})</div><ul className="val-list">{allErrs.map((e,i)=><li key={i}>{e}</li>)}</ul></div>}
+                  <div className="tcard">
+                    <div className="tc-head" style={{justifyContent:'space-between'}}><span className="tc-title">Upload Preview</span>
+                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                        <span style={{fontSize:12,color:'rgba(211,211,211,.6)'}}>{bulkRows.length} rows parsed</span>
+                        <button className="btn btn-ghost btn-sm" onClick={clearUpload} disabled={bulkSaving}>Clear</button>
+                        <button className="btn btn-primary btn-sm" onClick={confirmBulk} disabled={v===0||bulkSaving}>
+                          {bulkSaving?'Saving to Django…':'Import Valid Records'}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="tscroll"><table>
+                      <thead><tr><th>#</th><th>Status</th><th>Time &amp; Date</th><th>Location</th><th>Involved</th><th>Occupancy</th><th>Damage</th><th>Inj.</th><th>Cas.</th><th>Station</th><th>Engine</th><th>Alarm</th><th>Inputted By</th></tr></thead>
+                      <tbody>
+                        {bulkRows.map(r=><tr key={r.rowNum} className={r.valid?'':'prev-err'}>
+                          <td className="td-no" style={{fontSize:11,color:'var(--text3)'}}>{r.rowNum}</td>
+                          <td><span className={`st-badge ${r.valid?'st-ok':'st-err'}`}>{r.valid?'Valid':'Error'}</span></td>
+                          <td className="td-dt" style={{fontSize:12}}>{r.data.date?`${fmtDate(r.data.date)} ${r.data.time}`:<em>invalid</em>}</td>
+                          <td>{r.data.location||<em style={{color:'var(--danger)'}}>missing</em>}</td>
+                          <td>{r.data.involved?<InvTag value={r.data.involved}/>:<em style={{color:'var(--danger)'}}>invalid</em>}</td>
+                          <td style={{fontSize:12}}>{r.data.occupancy||'—'}</td>
+                          <DmgCell value={r.data.damage}/>
+                          <NumCell value={r.data.injured} cls="inj"/>
+                          <NumCell value={r.data.casualty} cls="cas"/>
+                          <td className="td-stn" style={{fontSize:12}}>{r.data.station||'—'}</td>
+                          <td className="td-stn" style={{fontSize:12}}>{r.data.engine||'—'}</td>
+                          <td><AlarmTag alarm={r.data.alarm}/></td>
+                          <td style={{maxWidth:120,overflow:'hidden'}}><InpCell name={curUser} personnel={personnel}/></td>
+                        </tr>)}
+                      </tbody>
+                    </table></div>
+                  </div>
+                </>;
+              })()}
+              {bulkResult&&<div style={{marginTop:24}}>
+                <div className="result-box">
+                  <div className="res-icon"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+                  <div className="res-title">Upload Complete</div>
+                  <div className="res-sub">Records saved to Django, sorted chronologically.</div>
+                  <div className="res-stats">
+                    <div className="res-stat"><div className="res-n g">{bulkResult.count}</div><div className="res-l">Imported</div></div>
+                    {bulkResult.skipped>0&&<div className="res-stat"><div className="res-n r">{bulkResult.skipped}</div><div className="res-l">Skipped</div></div>}
+                    <div className="res-stat"><div className="res-n">{incidents.length}</div><div className="res-l">Total Records</div></div>
+                  </div>
+                  <div style={{display:'flex',gap:10,justifyContent:'center',flexWrap:'wrap'}}>
+                    <button className="btn btn-outline" onClick={clearUpload}>Upload Another</button>
+                    <button className="btn btn-primary" onClick={()=>navTo('incidents')}>View All Records</button>
+                  </div>
+                </div>
+              </div>}
+            </>
+          )}
+
+          {/* ════ REPORTS ════ */}
+          {page==='reports'&&(
+            <>
+              <div className="prep-notice">
+                <div className="prep-notice-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 18 15 15"/></svg></div>
+                <p>Reports will be prepared by <strong>{curUser}</strong>. The <em>Prepared By</em> field in the export will reflect the current active user.</p>
+              </div>
+              <div className="sec-div"><div className="div-acc"/><div className="sec-title">Quick Export Options</div><div className="div-line"/></div>
+              <div className="report-grid">
+                {['All Records','By Year','By Month','Custom Range'].map(c=>(
+                  <div key={c} className="rcard" onClick={()=>setExpOpen(true)}>
+                    <div className="rcard-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg></div>
+                    <div className="rcard-name">{c}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="sec-div"><div className="div-acc"/><div className="sec-title">Summary Statistics</div><div className="div-line"/></div>
+              <div className="sum-stats">
+                <div className="stat-card acc"><div className="stat-lbl">By {personnel[0].name}</div><div className="stat-val">{u1cnt}</div><div className="stat-sub">records entered</div></div>
+                <div className="stat-card"><div className="stat-lbl">By {personnel[1].name}</div><div className="stat-val">{u2cnt}</div><div className="stat-sub">records entered</div></div>
+                <div className="stat-card acc"><div className="stat-lbl">Avg. Damage</div><div className="stat-val m">₱{(total?Math.round(allDmg/total):0).toLocaleString()}</div><div className="stat-sub">per incident</div></div>
+              </div>
+              <div className="sec-div" style={{marginTop:8}}><div className="div-acc"/><div className="sec-title">Summary Reports by Year</div><div className="div-line"/></div>
+              <div className="tcard">
+                <div className="tc-head"><span className="tc-title">Annual Breakdown</span>{yearData.length>1&&<div className="tc-actions"><span style={{fontSize:11,color:'rgba(211,211,211,.55)'}}>{yearData[0].year} – {yearData[yearData.length-1].year} · {yearData.length} years</span></div>}</div>
+                <div className="yr-table-wrap">
+                  {!yearData.length?<div className="yr-empty">No incident records yet.</div>:(
+                    <table className="yr-table">
+                      <thead><tr><th>Year</th><th className="num">Total</th><th className="num">Structural</th><th className="num">Non-Structural</th><th>Est. Total Damage</th><th className="num">Injured</th><th className="num">Casualties</th><th className="num">By {personnel[0].name}</th><th className="num">By {personnel[1].name}</th></tr></thead>
+                      <tbody>{yearData.map(y=><tr key={y.year}><td className="year-cell">{y.year}</td><td className="num">{y.total}</td><td className="num">{y.structural}</td><td className="num">{y.nonstructural}</td><td className="dmg-cell">₱{y.damage.toLocaleString()}</td><td className="inj-cell">{y.injured}</td><td className="cas-cell">{y.casualty}</td><td className="num">{y.u1}</td><td className="num">{y.u2}</td></tr>)}</tbody>
+                      <tfoot><tr><td className="tl">All Years</td><td style={{textAlign:'center'}}>{yrTotals.total}</td><td style={{textAlign:'center'}}>{yrTotals.structural}</td><td style={{textAlign:'center'}}>{yrTotals.nonstructural}</td><td>₱{yrTotals.damage.toLocaleString()}</td><td style={{textAlign:'center',color:'#ffc864'}}>{yrTotals.injured}</td><td style={{textAlign:'center',color:'#ff9090'}}>{yrTotals.casualty}</td><td style={{textAlign:'center'}}>{yrTotals.u1}</td><td style={{textAlign:'center'}}>{yrTotals.u2}</td></tr></tfoot>
+                    </table>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ════ PERSONNEL ════ */}
+          {page==='personnel'&&(
+            <>
+              <div className="personnel-info-box" style={{marginBottom:22}}>
+                <svg viewBox="0 0 24 24" width="18" height="18" stroke="var(--navy)" fill="none" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                <p>Manage the two authorized personnel accounts. You can <strong>edit display names</strong> and <strong>switch the active user</strong>. <strong>Existing records retain the name used at the time of entry.</strong></p>
+              </div>
+              <div className="personnel-grid">
+                {personnel.map((p,idx)=>{
+                  const cnt=incidents.filter(i=>i.inputter===p.name).length,isActive=idx===curUserIdx;
+                  return<div key={p.id} className="personnel-card">
+                    <div className="pc-header">
+                      <div className={`pc-avatar ${p.colorClass}`}>{getInitials(p.name)}</div>
+                      <div className="pc-info"><div className="pc-name">{p.name}</div><div className="pc-role">Authorized Personnel</div></div>
+                      {isActive&&<span className="pc-active-badge">● Active</span>}
+                    </div>
+                    <div className="pc-body">
+                      <div className="pc-stat-row">
+                        <div className="pc-stat"><div className="pc-stat-n">{cnt}</div><div className="pc-stat-l">Records Entered</div></div>
+                        <div className="pc-stat"><div className="pc-stat-n">{incidents.filter(i=>i.inputter===p.name&&i.involved==='Structural').length}</div><div className="pc-stat-l">Structural</div></div>
+                        <div className="pc-stat"><div className="pc-stat-n">{incidents.filter(i=>i.inputter===p.name&&i.involved==='Non-Structural').length}</div><div className="pc-stat-l">Non-Structural</div></div>
+                      </div>
+                      <div className="pc-actions">
+                        <button className="pc-edit-btn" onClick={()=>openNameModal(idx)}>
+                          <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                          Edit Name
+                        </button>
+                        <button className={`pc-switch-btn${isActive?' active-user':''}`} onClick={()=>{setCurUserIdx(idx);toast(`Switched to ${p.name}.`);}}>
+                          {isActive?'● Currently Active':'Set as Active'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>;
+                })}
+              </div>
+            </>
+          )}
+
+        </div>{/* /content */}
+      </div>{/* /main */}
+
+      {/* ════ ADD/EDIT INCIDENT MODAL ════ */}
+      {modalOpen&&(
+        <div className="modal-ov open" onClick={e=>{if(e.target.classList.contains('modal-ov'))setModalOpen(false);}}>
+          <div className="modal">
+            <div className="modal-hd"><div className="modal-title">{editingId!==null?'Edit Incident':'Add Fire Incident'}</div><button className="modal-x" onClick={()=>setModalOpen(false)}>✕</button></div>
+            <div className="modal-body">
+              <div className="form-grid">
+                {[{label:'Time (HHMMH)',key:'time',placeholder:'e.g. 0133H'},{label:'Date',key:'date',type:'date'}].map(f=>(
+                  <div key={f.key} className="fg">
+                    <label className="flbl">{f.label}</label>
+                    <input type={f.type||'text'} className={`finput${formErrs[f.key]?' err':''}`} value={form[f.key]} onChange={e=>setF(f.key,e.target.value)} placeholder={f.placeholder||''}/>
+                    {formErrs[f.key]&&<div className="field-err">{formErrs[f.key]}</div>}
+                  </div>
+                ))}
+                <div className="fg full">
+                  <label className="flbl">Location (Barangay)</label>
+                  <input className={`finput${formErrs.location?' err':''}`} value={form.location} onChange={e=>setF('location',e.target.value)} placeholder="e.g. Brgy Nazareth"/>
+                  {formErrs.location&&<div className="field-err">{formErrs.location}</div>}
+                </div>
+                <div className="fg"><label className="flbl">Involved</label><select className="fsel" value={form.involved} onChange={e=>setF('involved',e.target.value)}><option>Structural</option><option>Non-Structural</option></select></div>
+                <div className="fg"><label className="flbl">Occupancy</label><input className="finput" value={form.occupancy} onChange={e=>setF('occupancy',e.target.value)} placeholder="e.g. Mercantile"/></div>
+                <div className="fg"><label className="flbl">Estimated Damage (₱)</label><input type="number" className="finput" value={form.damage} onChange={e=>setF('damage',e.target.value)} placeholder="0" min="0"/></div>
+                <div className="fg"><label className="flbl">No. of Injured</label><input type="number" className="finput" value={form.injured} onChange={e=>setF('injured',e.target.value)} placeholder="0" min="0"/></div>
+                <div className="fg"><label className="flbl">No. of Casualties</label><input type="number" className="finput" value={form.casualty} onChange={e=>setF('casualty',e.target.value)} placeholder="0" min="0"/></div>
+                <div className="fg"><label className="flbl">Station No.</label><input className="finput" value={form.station} onChange={e=>setF('station',e.target.value)} placeholder="e.g. Station 4"/></div>
+                <div className="fg"><label className="flbl">Engine No.</label><input className="finput" value={form.engine} onChange={e=>setF('engine',e.target.value)} placeholder="e.g. Engine 4"/></div>
+                <div className="fg"><label className="flbl">Alarm Status</label><select className="fsel" value={form.alarm} onChange={e=>setF('alarm',e.target.value)}>{ALARMS.map(a=><option key={a}>{a}</option>)}</select></div>
+                <div className="fg"><label className="flbl">Inputted By</label><select className="fsel" value={form.inputter} onChange={e=>setF('inputter',e.target.value)}>{personnel.map(p=><option key={p.id} value={p.name}>{p.name}</option>)}</select></div>
+              </div>
+            </div>
+            <div className="modal-ft">
+              <button className="btn btn-outline" onClick={()=>setModalOpen(false)} disabled={saving}>Cancel</button>
+              <button className="btn btn-primary" onClick={saveIncident} disabled={saving}>{saving?'Saving…':'Save Incident'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ════ EXPORT MODAL ════ */}
+      {expOpen&&(
+        <div className="modal-ov open" onClick={e=>{if(e.target.classList.contains('modal-ov'))setExpOpen(false);}}>
+          <div className="modal modal-sm">
+            <div className="modal-hd"><div className="modal-title">Export to CSV</div><button className="modal-x" onClick={()=>setExpOpen(false)}>✕</button></div>
+            <div className="modal-body">
+              <p style={{fontSize:13,color:'var(--text-mid)',marginBottom:16,lineHeight:1.6}}>Select the date range. Prepared by: <strong>{curUser}</strong></p>
+              <div className="date-range-opts">
+                {[
+                  {val:'all',label:'All Records',sub:'Export every incident in the system'},
+                  {val:'year',label:'Specific Year',sub:'e.g. 2018'},
+                  {val:'month',label:'Specific Month & Year',sub:'e.g. March 2026'},
+                  {val:'range',label:'Custom Date Range',sub:'e.g. 01 January 2018 – 31 December 2018'},
+                ].map(opt=>(
+                  <label key={opt.val} className={`dr-opt${expType===opt.val?' selected':''}`}>
+                    <input type="radio" name="drtype" value={opt.val} checked={expType===opt.val} onChange={()=>setExpType(opt.val)}/>
+                    <div className="dr-opt-body">
+                      <div className="dr-opt-lbl">{opt.label}</div><div className="dr-opt-sub">{opt.sub}</div>
+                      {expType===opt.val&&opt.val==='year'&&<div className="dr-inputs" style={{marginTop:8}}><input type="number" className="finput" value={expYear} onChange={e=>setExpYear(+e.target.value)} placeholder="e.g. 2026" min="1900" max="2099"/></div>}
+                      {expType===opt.val&&opt.val==='month'&&<div className="dr-inputs row" style={{marginTop:8}}><select className="fsel" style={{flex:1}} value={expMonth} onChange={e=>setExpMonth(+e.target.value)}>{MNAMES.map((m,i)=><option key={m} value={i}>{m}</option>)}</select><input type="number" className="finput" value={expMyear} onChange={e=>setExpMyear(+e.target.value)} placeholder="Year" style={{width:90}}/></div>}
+                      {expType===opt.val&&opt.val==='range'&&<div className="dr-inputs row" style={{marginTop:8}}><input type="date" className="finput" value={expFrom} onChange={e=>setExpFrom(e.target.value)} style={{flex:1}}/><span className="dr-dash">—</span><input type="date" className="finput" value={expTo} onChange={e=>setExpTo(e.target.value)} style={{flex:1}}/></div>}
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="modal-ft"><button className="btn btn-outline" onClick={()=>setExpOpen(false)}>Cancel</button><button className="btn btn-primary" onClick={doExport}>Download CSV</button></div>
+          </div>
+        </div>
+      )}
+
+      {/* ════ EDIT NAME MODAL ════ */}
+      {nameModalIdx!==null&&(
+        <div className="modal-ov open" onClick={e=>{if(e.target.classList.contains('modal-ov'))setNameModalIdx(null);}}>
+          <div className="modal modal-xs">
+            <div className="modal-hd"><div className="modal-title">Edit Name — Personnel {nameModalIdx+1}</div><button className="modal-x" onClick={()=>setNameModalIdx(null)}>✕</button></div>
+            <div className="modal-body">
+              <div className="name-edit-form">
+                <div className="name-preview">
+                  <div className={`name-preview-avatar ${personnel[nameModalIdx].colorClass}`}>{getInitials(newNameVal||personnel[nameModalIdx].name)}</div>
+                  <div className="name-preview-text">Editing: <strong>{personnel[nameModalIdx].name}</strong></div>
+                </div>
+                <div className="fg">
+                  <label className="flbl">New Display Name</label>
+                  <input type="text" className={`finput${newNameErr?' err':''}`} value={newNameVal} maxLength={60} autoFocus
+                    onChange={e=>{setNewNameVal(e.target.value);setNewNameErr(validateNewName(e.target.value));}}
+                    onKeyDown={e=>{if(e.key==='Enter')savePersonnelName();}}
+                    placeholder="e.g. Mr. Santos"/>
+                  {newNameErr&&<div className="field-err">{newNameErr}</div>}
+                </div>
+                <div className="warn-box"><strong>Note:</strong> Changing this name will update how it appears in the sidebar and all new records. Existing records retain the original name.</div>
+              </div>
+            </div>
+            <div className="modal-ft">
+              <button className="btn btn-outline" onClick={()=>setNameModalIdx(null)} disabled={nameSaving}>Cancel</button>
+              <button className="btn btn-primary" onClick={savePersonnelName} disabled={!!validateNewName(newNameVal)||nameSaving}>{nameSaving?'Saving…':'Save Name'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ════ DELETE CONFIRM ════ */}
+      {deleteId!==null&&(
+        <div className="conf-ov open" onClick={e=>{if(e.target.classList.contains('conf-ov'))setDeleteId(null);}}>
+          <div className="conf-box">
+            <div style={{width:48,height:48,borderRadius:'50%',background:'var(--danger-lt)',display:'flex',alignItems:'center',justifyContent:'center',marginBottom:14}}>
+              <svg viewBox="0 0 24 24" width="24" height="24" stroke="var(--danger)" fill="none" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg>
+            </div>
+            <div className="conf-title">Delete Incident?</div>
+            <div className="conf-body">This record will be permanently removed from Django. This cannot be undone.</div>
+            <div className="conf-btns"><button className="btn btn-outline" onClick={()=>setDeleteId(null)}>Cancel</button><button className="btn-danger-solid" onClick={confirmDelete}>Delete</button></div>
+          </div>
+        </div>
+      )}
+
+      {/* ════ TOASTS ════ */}
+      <div className="toast-c">
+        {toasts.map(t=><div key={t.id} className={`toast${t.type?' '+t.type:''}`}>{t.msg}</div>)}
+      </div>
+    </div>
+  );
+}
