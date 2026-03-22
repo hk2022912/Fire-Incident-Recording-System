@@ -103,9 +103,16 @@ tbody tr:last-child td{border-bottom:none}
 .td-num.inj{color:var(--warn)}
 .td-num.cas{color:var(--danger)}
 .td-stn{font-size:11px;color:var(--text-mid);white-space:nowrap}
+
+/* ── Involved / Alarm tags ── */
 .tag{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.3px;white-space:nowrap}
-.tag-s{background:rgba(0,51,102,.1);color:var(--navy);border:1px solid rgba(0,51,102,.2)}
-.tag-n{background:var(--gray-light);color:var(--text-mid);border:1px solid var(--gray)}
+/* Structural — yellow */
+.tag-s{background:#fffde7;color:#92700a;border:1px solid #f5cc00}
+/* Non-Structural — blue */
+.tag-n{background:#e8f0fe;color:#1a56b0;border:1px solid #93b4f5}
+/* Vehicular — orange */
+.tag-v{background:#fff1e6;color:#c2410c;border:1px solid #fb923c}
+
 .tag-a1{background:#edf7f2;color:#166534;border:1px solid #b4dfc5}
 .tag-a2{background:#fffbeb;color:#92400e;border:1px solid #fcd97a}
 .tag-a3{background:#fef0ee;color:#c0392b;border:1px solid #f5b8b0}
